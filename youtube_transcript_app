@@ -1,0 +1,396 @@
+import streamlit as st
+import yt_dlp as ytdlp
+from youtube_transcript_api import YouTubeTranscriptApi
+import os
+import re
+import requests
+from dotenv import load_dotenv
+
+# Load environment variables (optional, no required API keys)
+load_dotenv()
+
+
+def extract_video_id(url):
+    """Extract video ID from YouTube URL"""
+    patterns = [
+        r'(?:v=|\/)([0-9A-Za-z_-]{11}).*',
+        r'(?:embed\/)([0-9A-Za-z_-]{11})',
+        r'(?:watch\?v=)([0-9A-Za-z_-]{11})'
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+
+def get_video_info(url):
+    """Get video metadata"""
+    try:
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True
+        }
+        with ytdlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return {
+                'title': info.get('title', 'Unknown'),
+                'thumbnail': info.get('thumbnail', ''),
+                'duration': info.get('duration', 0),
+                'uploader': info.get('uploader', 'Unknown'),
+                'description': info.get('description', '')[:200] + "..." if info.get('description') else ""
+            }
+    except Exception as e:
+        return {'error': str(e)}
+
+
+def get_available_languages(video_id):
+    """Get list of available transcript languages"""
+    try:
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        languages = []
+        for transcript in transcript_list:
+            languages.append({
+                'code': transcript.language_code,
+                'name': transcript.language,
+                'auto': transcript.is_generated
+            })
+        return languages
+    except Exception as e:
+        return []
+
+
+def get_video_transcript(video_id, language="en"):
+    """Fetch video transcript with language selection"""
+    try:
+        # Try to get transcript in the specified language
+        transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=[language])
+        return transcript
+    except Exception as e:
+        # Try auto-generated English if manual fails
+        try:
+            transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=["en"])
+            return transcript
+        except Exception as e2:
+            return f"Error: {str(e2)}"
+
+
+def format_transcript_text(transcript):
+    """Convert transcript list to clean text"""
+    if isinstance(transcript, list):
+        text = " ".join([entry['text'] for entry in transcript])
+        # Clean up the text
+        text = re.sub(r'\[.*?\]', '', text)  # Remove [Music], [Applause] etc.
+        text = re.sub(r'\s+', ' ', text)  # Fix multiple spaces
+        return text.strip()
+    return str(transcript)
+
+
+def romanize_with_google_translate(text):
+    """Free romanization using Google Translate (unofficial API)"""
+    try:
+        from googletrans import Translator
+        translator = Translator()
+
+        # Detect language and translate to English if not already
+        detected = translator.detect(text)
+        if detected.lang != 'en':
+            result = translator.translate(text, dest='en')
+            return result.text
+        else:
+            return text  # Already in English/Latin script
+
+    except ImportError:
+        return "Error: Install googletrans with: pip install googletrans==3.1.0a0"
+    except Exception as e:
+        return f"Google Translate Error: {str(e)}"
+
+
+def romanize_with_libre_translate(text):
+    """Free romanization using LibreTranslate public API"""
+    try:
+        # Using public LibreTranslate instance
+        url = "https://libretranslate.de/translate"
+
+        payload = {
+            "q": text[:5000],  # Limit text length
+            "source": "auto",
+            "target": "en",
+            "format": "text"
+        }
+
+        response = requests.post(url, data=payload, timeout=30)
+
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("translatedText", text)
+        else:
+            return f"LibreTranslate Error: HTTP {response.status_code}"
+
+    except Exception as e:
+        return f"LibreTranslate Error: {str(e)}"
+
+
+def romanize_with_mymemory(text):
+    """Free romanization using MyMemory API"""
+    try:
+        url = "https://api.mymemory.translated.net/get"
+
+        # Split text into chunks (MyMemory has 500 char limit)
+        max_chunk = 500
+        if len(text) > max_chunk:
+            chunks = [text[i:i + max_chunk] for i in range(0, len(text), max_chunk)]
+            results = []
+
+            for i, chunk in enumerate(chunks):
+                if i > 0:  # Add small delay between requests
+                    import time
+                    time.sleep(1)
+
+                params = {
+                    "q": chunk,
+                    "langpair": "auto|en"
+                }
+
+                response = requests.get(url, params=params, timeout=10)
+
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get("responseStatus") == 200:
+                        results.append(data["responseData"]["translatedText"])
+                    else:
+                        results.append(chunk)
+                else:
+                    results.append(chunk)
+
+            return " ".join(results)
+        else:
+            params = {
+                "q": text,
+                "langpair": "auto|en"
+            }
+
+            response = requests.get(url, params=params, timeout=10)
+
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("responseStatus") == 200:
+                    return data["responseData"]["translatedText"]
+
+            return text
+
+    except Exception as e:
+        return f"MyMemory Error: {str(e)}"
+
+
+def download_audio(url):
+    """Download audio from YouTube"""
+    try:
+        ydl_opts = {
+            'format': 'bestaudio[ext=wav]/bestaudio[ext=mp3]/bestaudio',
+            'outtmpl': 'downloaded_audio.%(ext)s',
+            'quiet': True,
+            'no_warnings': True
+        }
+
+        with ytdlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+
+        # Find downloaded file
+        for ext in ['wav', 'mp3', 'webm', 'm4a']:
+            filename = f'downloaded_audio.{ext}'
+            if os.path.exists(filename):
+                return filename
+        return None
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+def main():
+    st.title("YouTube Transcript & Romanization Tool")
+    st.write("Get video transcripts and romanize lyrics - No API keys required!")
+
+    # Information about free services
+    with st.expander("About This Tool"):
+        st.markdown("""
+        **This tool uses completely FREE services:**
+
+        - **YouTube Transcript API** - Built into YouTube (always free)
+        - **Google Translate** - Free unofficial API (no registration needed)
+        - **LibreTranslate** - Open source translation service (free)
+        - **MyMemory** - Free translation API (no registration needed)
+
+        **No API keys, tokens, or registration required!**
+        """)
+
+    # URL input
+    youtube_url = st.text_input("Enter YouTube URL:", placeholder="https://www.youtube.com/watch?v=...")
+
+    if youtube_url:
+        # Extract video ID
+        video_id = extract_video_id(youtube_url)
+        if not video_id:
+            st.error("Invalid YouTube URL. Please check the format.")
+            return
+
+        st.success(f"Video ID: {video_id}")
+
+        # Get video info
+        with st.spinner("Getting video information..."):
+            video_info = get_video_info(youtube_url)
+
+        if 'error' in video_info:
+            st.error(f"Could not get video info: {video_info['error']}")
+            return
+
+        # Display video info
+        col1, col2 = st.columns([2, 1])
+
+        with col1:
+            st.subheader(f"{video_info['title']}")
+            st.write(f"**Channel:** {video_info['uploader']}")
+            st.write(f"**Duration:** {video_info['duration'] // 60}:{video_info['duration'] % 60:02d}")
+            if video_info['description']:
+                st.write(f"**Description:** {video_info['description']}")
+
+        with col2:
+            if video_info['thumbnail']:
+                st.image(video_info['thumbnail'], width=200)
+
+        # Embed video
+        st.video(youtube_url)
+
+        # Check available languages
+        with st.spinner("Checking available transcripts..."):
+            available_languages = get_available_languages(video_id)
+
+        if not available_languages:
+            st.warning("No transcripts available for this video")
+            st.info("This video doesn't have captions/subtitles. Try a different video or use manual input.")
+
+            # Fallback option for manual lyrics
+            st.subheader("Manual Lyrics Input")
+            manual_lyrics = st.text_area(
+                "Paste lyrics manually:",
+                height=200,
+                placeholder="Find lyrics online and paste them here..."
+            )
+
+            if manual_lyrics.strip():
+                transcript_text = manual_lyrics.strip()
+            else:
+                return
+        else:
+            # Show available languages
+            st.subheader("Available Transcripts")
+
+            language_options = []
+            for lang in available_languages:
+                auto_text = " (auto-generated)" if lang['auto'] else " (manual)"
+                language_options.append(f"{lang['name']} ({lang['code']}){auto_text}")
+
+            selected_lang_display = st.selectbox("Choose language:", language_options)
+
+            # Extract language code
+            selected_lang_code = available_languages[language_options.index(selected_lang_display)]['code']
+
+            # Get transcript
+            with st.spinner("Fetching transcript..."):
+                transcript = get_video_transcript(video_id, selected_lang_code)
+
+            if isinstance(transcript, str) and transcript.startswith("Error"):
+                st.error(transcript)
+                return
+
+            # Format transcript
+            transcript_text = format_transcript_text(transcript)
+
+            # Show transcript
+            st.subheader("Video Transcript")
+
+            # Show timestamps option
+            show_timestamps = st.checkbox("Show timestamps")
+
+            if show_timestamps and isinstance(transcript, list):
+                transcript_display = ""
+                for entry in transcript:
+                    start_time = int(entry['start'])
+                    text = entry['text']
+                    transcript_display += f"[{start_time // 60}:{start_time % 60:02d}] {text}\n"
+                st.text_area("Transcript with timestamps", transcript_display, height=300)
+            else:
+                st.text_area("Clean transcript", transcript_text, height=300)
+
+        # Romanization section
+        if transcript_text and transcript_text.strip():
+            st.subheader("Text Romanization")
+
+            st.info("All romanization options are completely FREE and require no API keys!")
+
+            romanization_method = st.radio(
+                "Choose romanization method:",
+                ["Google Translate (Recommended)",
+                 "LibreTranslate (Open Source)",
+                 "MyMemory (Free API)",
+                 "Skip romanization"]
+            )
+
+            if romanization_method != "Skip romanization":
+                if st.button("Romanize Text"):
+                    if romanization_method == "Google Translate (Recommended)":
+                        with st.spinner("Romanizing with Google Translate..."):
+                            romanized = romanize_with_google_translate(transcript_text)
+
+                    elif romanization_method == "LibreTranslate (Open Source)":
+                        with st.spinner("Romanizing with LibreTranslate..."):
+                            romanized = romanize_with_libre_translate(transcript_text)
+
+                    elif romanization_method == "MyMemory (Free API)":
+                        with st.spinner("Romanizing with MyMemory..."):
+                            romanized = romanize_with_mymemory(transcript_text)
+
+                    if not romanized.startswith("Error"):
+                        st.subheader("Romanized Result")
+                        st.text_area("Romanized text", romanized, height=300)
+
+                        # Download options
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.download_button(
+                                "Download Original",
+                                data=transcript_text,
+                                file_name="original_transcript.txt",
+                                mime="text/plain"
+                            )
+                        with col2:
+                            st.download_button(
+                                "Download Romanized",
+                                data=romanized,
+                                file_name="romanized_transcript.txt",
+                                mime="text/plain"
+                            )
+                    else:
+                        st.error(romanized)
+
+        # Audio download section
+        st.subheader(" Audio Download")
+        if st.button("Download Audio"):
+            with st.spinner("Downloading audio..."):
+                audio_path = download_audio(youtube_url)
+
+            if audio_path and not isinstance(audio_path, str) or not audio_path.startswith("Error"):
+                st.success(f"Audio downloaded: {audio_path}")
+
+                if os.path.exists(audio_path):
+                    st.audio(audio_path)
+                    file_size = os.path.getsize(audio_path) / (1024 * 1024)
+                    st.info(f"File size: {file_size:.1f} MB")
+            else:
+                st.error("Audio download failed")
+                if isinstance(audio_path, str):
+                    st.error(audio_path)
+
+
+if __name__ == "__main__":
+    main()
